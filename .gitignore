@@ -1,3 +1,21 @@
-.aider*
+# Environment
 .env
+
+# Virtual environment
 venv/
+
+# Google auth / secrets — never commit these
+client_secret_*.json
+drive_token.json
+*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Temp files
+temp_files/
+
+# Aider
+.aider*
