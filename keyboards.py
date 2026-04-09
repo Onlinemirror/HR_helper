@@ -14,6 +14,8 @@ def main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📋 Создать документ"),
              KeyboardButton(text="📄 Загрузить файл")],
             [KeyboardButton(text="📊 Оценка 360")],
+            [KeyboardButton(text="📥 Файлы сотрудника"),
+             KeyboardButton(text="📁 Синхронизировать папки Drive")],
         ],
         resize_keyboard=True,
     )
@@ -30,6 +32,17 @@ def skip_or_cancel_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Пропустить")],
+            [KeyboardButton(text="🚫 Отмена")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def accept_num_kb() -> ReplyKeyboardMarkup:
+    """Клавиатура для шага ввода номера приказа."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Принять")],
             [KeyboardButton(text="🚫 Отмена")],
         ],
         resize_keyboard=True,
@@ -134,6 +147,32 @@ def doc_type_kb(category: str, entity_code: str) -> InlineKeyboardMarkup:
             )])
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="gen:back")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def subfolders_kb(subfolders: list[dict]) -> InlineKeyboardMarkup:
+    """
+    Inline-клавиатура для выбора папки сотрудника.
+    subfolders — список {"id": ..., "name": ...}
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f["name"], callback_data=f"dlfolder:{i}")]
+            for i, f in enumerate(subfolders)
+        ] + [[InlineKeyboardButton(text="🚫 Отмена", callback_data="dl:cancel")]]
+    )
+
+
+def upload_category_kb(categories: list[str]) -> InlineKeyboardMarkup:
+    """Inline-клавиатура выбора категории загружаемого документа."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text=cat,
+                callback_data=f"ucat:{i}",
+            )]
+            for i, cat in enumerate(categories)
+        ] + [[InlineKeyboardButton(text="🚫 Отмена", callback_data="upload:cancel")]]
+    )
 
 
 def score_kb(criterion_key: str) -> InlineKeyboardMarkup:

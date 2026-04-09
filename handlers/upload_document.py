@@ -6,10 +6,10 @@ from pathlib import Path
 
 import aiofiles
 from aiogram import Bot, F, Router
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, Message
 
 CANCEL = F.text != "🚫 Отмена"
-from aiogram.fsm.context import FSMContext
-from aiogram.types import Message
 
 import config
 import google_api
@@ -63,29 +63,55 @@ async def process_upload_query(message: Message, state: FSMContext) -> None:
     full_name  = row_data[config.COL["Полное ФИО"] - 1]
 
     await state.update_data(folder_id=folder_id, full_name=full_name)
-    await state.set_state(UploadDocument.waiting_file)
+    await state.set_state(UploadDocument.waiting_doc_category)
 
     await message.answer(
         f"✅ Сотрудник найден: <b>{full_name}</b>\n\n"
-        "📎 Отправьте файл или фото для загрузки в его папку на Drive:",
-        reply_markup=kb.cancel_kb(),
+        "📁 Выберите категорию документа:",
+        reply_markup=kb.remove_kb,
         parse_mode="HTML",
     )
+    await message.answer("👇", reply_markup=kb.upload_category_kb(config.UPLOAD_DOC_CATEGORIES))
 
 
-# ── Шаг 3 — приём и загрузка файла ───────────────────────────────────────────
+# ── Шаг 3 — выбор категории (callback) ────────────────────────────────────────
+
+@router.callback_query(lambda c: c.data and c.data.startswith("ucat:"))
+async def process_upload_category(call: CallbackQuery, state: FSMContext) -> None:
+    idx = int(call.data.split(":")[1])
+    if idx < 0 or idx >= len(config.UPLOAD_DOC_CATEGORIES):
+        await call.answer("Неизвестная категория", show_alert=True)
+        return
+
+    category = config.UPLOAD_DOC_CATEGORIES[idx]
+    await state.update_data(doc_category=category)
+
+    await call.message.edit_text(f"📁 Категория: <b>{category}</b>", parse_mode="HTML")
+    await call.message.answer(
+        "📎 Отправьте файл или фото для загрузки:",
+        reply_markup=kb.cancel_kb(),
+    )
+    await state.set_state(UploadDocument.waiting_file)
+    await call.answer()
+
+
+@router.callback_query(lambda c: c.data == "upload:cancel")
+async def cb_upload_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await call.message.delete()
+    await call.message.answer("Отменено.", reply_markup=kb.main_menu())
+    await call.answer()
+
+
+# ── Шаг 4 — приём и загрузка файла ───────────────────────────────────────────
 
 @router.message(UploadDocument.waiting_file)
 async def process_file(message: Message, state: FSMContext, bot: Bot) -> None:
-    # Определяем тип вложения
-    document = None
-    file_name = None
-
     if message.document:
         file_id   = message.document.file_id
         file_name = message.document.file_name or f"document_{file_id}"
     elif message.photo:
-        photo     = message.photo[-1]   # лучшее качество
+        photo     = message.photo[-1]
         file_id   = photo.file_id
         file_name = f"photo_{file_id}.jpg"
     else:
@@ -95,26 +121,40 @@ async def process_file(message: Message, state: FSMContext, bot: Bot) -> None:
         )
         return
 
-    data      = await state.get_data()
-    folder_id = data["folder_id"]
-    full_name = data["full_name"]
+    data         = await state.get_data()
+    folder_id    = data["folder_id"]
+    full_name    = data["full_name"]
+    doc_category = data.get("doc_category", "Прочее")
 
-    await message.answer(f"⏳ Загружаю <b>{file_name}</b> на Google Drive...",
-                         parse_mode="HTML", reply_markup=kb.remove_kb)
+    await message.answer(
+        f"⏳ Загружаю <b>{file_name}</b> → 📁 <b>{doc_category}</b>...",
+        parse_mode="HTML",
+        reply_markup=kb.remove_kb,
+    )
 
     local_path = Path(config.TEMP_DIR) / file_name
     try:
-        # Скачиваем файл во временную папку
+        # Скачиваем во временную папку
         await bot.download(file_id, destination=str(local_path))
 
-        # Загружаем на Drive (в потоке)
-        file_link = await to_thread(google_api.upload_file_to_drive, str(local_path), file_name, folder_id)
+        # Находим/создаём подпапку категории внутри папки сотрудника
+        subfolder_id = await to_thread(
+            google_api.get_or_create_subfolder, folder_id, doc_category
+        )
+
+        # Загружаем файл в подпапку
+        file_link = await to_thread(
+            google_api.upload_file_to_drive, str(local_path), file_name, subfolder_id
+        )
 
         await message.answer(
-            f"✅ Файл <b>{file_name}</b> успешно загружен в папку сотрудника <b>{full_name}</b>!\n\n"
+            f"✅ <b>{file_name}</b> загружен!\n\n"
+            f"👤 Сотрудник: <b>{full_name}</b>\n"
+            f"📁 Папка: <b>{doc_category}</b>\n\n"
             f"🔗 <a href=\"{file_link}\">Открыть файл на Drive</a>",
             reply_markup=kb.main_menu(),
             parse_mode="HTML",
+            disable_web_page_preview=True,
         )
     except Exception as e:
         logger.exception("Ошибка при загрузке файла на Drive")
@@ -125,7 +165,6 @@ async def process_file(message: Message, state: FSMContext, bot: Bot) -> None:
             parse_mode="HTML",
         )
     finally:
-        # Удаляем временный файл в любом случае
         if local_path.exists():
             local_path.unlink()
         await state.clear()

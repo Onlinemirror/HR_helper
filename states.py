@@ -19,13 +19,20 @@ class FireEmployee(StatesGroup):
 
 class UploadDocument(StatesGroup):
     waiting_employee_query = State()
+    waiting_doc_category   = State()   # выбор папки/категории документа
     waiting_file           = State()
 
 
 class GenerateDocument(StatesGroup):
-    waiting_employee  = State()   # ввод ИИН/ID
-    waiting_extra     = State()   # доп. поля (динамически)
-    confirm           = State()   # подтверждение
+    waiting_employee   = State()   # ввод ИИН/ID
+    waiting_prikaz_num = State()   # номер приказа (авто или ручной)
+    waiting_extra      = State()   # доп. поля (динамически)
+    confirm            = State()   # подтверждение
+
+
+class DownloadEmployeeFiles(StatesGroup):
+    waiting_employee = State()   # ввод ИИН/ID
+    waiting_folder   = State()   # выбор папки
 
 
 class Evaluate360(StatesGroup):

@@ -19,6 +19,14 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
 
 import config
 
+# ── pymorphy2 (склонение ФИО) — опциональная зависимость ─────────────────────
+try:
+    import pymorphy3 as _pymorphy3
+    _morph = _pymorphy3.MorphAnalyzer()
+    _MORPH_OK = True
+except ImportError:
+    _MORPH_OK = False
+
 SCOPES_SA = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -176,6 +184,48 @@ def _build_doc_name(template_name: str, full_name: str, num_tag: str, date: str)
     return " — ".join(parts)
 
 
+# ── Склонение ФИО ────────────────────────────────────────────────────────────
+
+def _decline_word(word: str, case: str) -> str:
+    """Склоняет одно слово в нужный падеж через pymorphy2."""
+    if not _MORPH_OK or not word:
+        return word
+    parsed = _morph.parse(word)
+    if not parsed:
+        return word
+    # Ищем разбор с именной семантикой (Имя / Отчество / Фамилия)
+    best = None
+    for p in parsed:
+        grammemes = set(p.tag.grammemes)
+        if grammemes & {"Name", "Patr", "Surn"}:
+            best = p
+            break
+    if best is None:
+        best = parsed[0]
+    inflected = best.inflect({case})
+    if inflected:
+        w = inflected.word
+        return w[0].upper() + w[1:] if w else word
+    return word
+
+
+def decline_full_name(full_name: str, case: str) -> str:
+    """
+    Склоняет ФИО целиком.
+
+    Падежи pymorphy2:
+      nomn — именительный   (кто?)       Иванов Иван Иванович
+      gent — родительный    (кого?)      Иванова Ивана Ивановича
+      datv — дательный      (кому?)      Иванову Ивану Ивановичу
+      accs — винительный    (кого?)      Иванова Ивана Ивановича
+      ablt — творительный   (кем?)       Ивановым Иваном Ивановичем
+      loct — предложный     (о ком?)     Иванове Иване Ивановиче
+    """
+    if not _MORPH_OK or not full_name:
+        return full_name
+    return " ".join(_decline_word(part, case) for part in full_name.strip().split())
+
+
 # ── Генерация сотрудника ──────────────────────────────────────────────────────
 
 def generate_employee_id(city: str) -> str:
@@ -279,6 +329,110 @@ def create_drive_folder(folder_name: str, parent_id: str) -> tuple[str, str]:
     return folder["id"], folder["webViewLink"]
 
 
+def sync_drive_folders() -> dict:
+    """
+    Проходит по всем строкам мастер-листа.
+    Если у сотрудника нет папки на Drive — создаёт и записывает ссылку.
+    Возвращает {"created": [str, ...], "skipped": int, "errors": [str, ...]}
+    """
+    sheet = _master_sheet()
+    all_rows = sheet.get_all_values()
+
+    created = []
+    skipped = 0
+    errors  = []
+
+    for idx, row in enumerate(all_rows[1:], start=2):   # start=2: пропускаем заголовок
+        padded     = row + [""] * (config.COL["Примечание"] - len(row))
+        emp_id     = padded[config.COL["ID"] - 1].strip()
+        full_name  = padded[config.COL["Полное ФИО"] - 1].strip()
+        drive_link = padded[config.COL["Папка Drive (ссылка)"] - 1].strip()
+
+        # Пропускаем пустые строки
+        if not emp_id or not full_name:
+            continue
+
+        # Папка уже есть — пропускаем
+        if drive_link:
+            skipped += 1
+            continue
+
+        try:
+            folder_name = f"{emp_id} {full_name}"
+            _, folder_link = create_drive_folder(folder_name, config.HR_DRIVE_FOLDER_ID)
+            sheet.update_cell(idx, config.COL["Папка Drive (ссылка)"], folder_link)
+            created.append(f"{emp_id} — {full_name}")
+        except Exception as e:
+            errors.append(f"{emp_id} — {full_name}: {e}")
+
+    return {"created": created, "skipped": skipped, "errors": errors}
+
+
+def list_employee_subfolders(folder_id: str) -> list[dict]:
+    """
+    Возвращает список подпапок в папке сотрудника.
+    Каждый элемент: {"id": ..., "name": ...}
+    Первым добавляется псевдо-элемент «Корневая папка» (сам folder_id).
+    """
+    service = _drive_service()
+    q = (f"'{folder_id}' in parents "
+         f"and mimeType='application/vnd.google-apps.folder' "
+         f"and trashed=false")
+    res = service.files().list(
+        q=q, fields="files(id,name)", orderBy="name",
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
+    subfolders = res.get("files", [])
+    # Корневая папка идёт первой, чтобы можно было забрать файлы не в подпапке
+    return [{"id": folder_id, "name": "📂 Корневая папка"}] + subfolders
+
+
+def list_files_in_folder(folder_id: str) -> list[dict]:
+    """
+    Возвращает список файлов (не папок) в указанной папке.
+    Каждый элемент: {"id": ..., "name": ..., "mimeType": ..., "size": int}
+    """
+    service = _drive_service()
+    q = (f"'{folder_id}' in parents "
+         f"and mimeType!='application/vnd.google-apps.folder' "
+         f"and trashed=false")
+    res = service.files().list(
+        q=q,
+        fields="files(id,name,mimeType,size,webViewLink)",
+        orderBy="name",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    files = res.get("files", [])
+    # size может отсутствовать у Google-native документов
+    for f in files:
+        f.setdefault("size", 0)
+    return files
+
+
+def download_file_bytes(file_id: str, mime_type: str) -> bytes:
+    """
+    Скачивает файл и возвращает bytes.
+    Google Docs / Sheets / Slides экспортируются в PDF.
+    """
+    service = _drive_service()
+    GOOGLE_NATIVE = {
+        "application/vnd.google-apps.document",
+        "application/vnd.google-apps.spreadsheet",
+        "application/vnd.google-apps.presentation",
+    }
+    if mime_type in GOOGLE_NATIVE:
+        return service.files().export(
+            fileId=file_id, mimeType="application/pdf"
+        ).execute()
+    return service.files().get_media(fileId=file_id).execute()
+
+
+def get_or_create_subfolder(parent_folder_id: str, subfolder_name: str) -> str:
+    """Находит или создаёт подпапку в папке сотрудника (через сервисный аккаунт)."""
+    return _find_or_create_folder_sa(subfolder_name, parent_folder_id)
+
+
 def upload_file_to_drive(local_path: str, file_name: str, folder_id: str) -> str:
     service = _drive_service()
     mime_type, _ = mimetypes.guess_type(local_path)
@@ -365,6 +519,7 @@ def generate_document(
     entity: str,
     employee_row: list[str],
     extra_vars: dict | None = None,
+    prikaz_num: str | None = None,   # если передан — используется вместо авто-счётчика
 ) -> dict:
     """
     Главная функция генерации документа.
@@ -397,7 +552,9 @@ def generate_document(
     tip_dog     = "ТД" if is_td else ("ГПХ" if is_gph else "ТД")
 
     # ── Номера документов ─────────────────────────────────────────────────
-    num_prikaz  = get_next_prikaz_number(entity) if is_prikaz else ""
+    num_prikaz  = (prikaz_num if prikaz_num
+                   else get_next_prikaz_number(entity) if is_prikaz
+                   else "")
     num_dogovor = (get_next_dogovor_number(entity, tip_dog) if is_dogovor
                    else lookup_last_dogovor(full_name, entity))
     num_spravka = get_next_doc_number("СПР", "Справка с места работы") if is_spravka else ""
@@ -465,7 +622,10 @@ def generate_document(
         ).execute()
 
     # ── Заменяем переменные ────────────────────────────────────────────────
+    fire_date_str = employee_row[config.COL["Дата увольнения"] - 1]
+
     variables = {
+        # Базовые данные сотрудника
         "{{ФИО}}":                full_name,
         "{{ДОЛЖНОСТЬ}}":          position,
         "{{ОТДЕЛ}}":              department,
@@ -474,6 +634,13 @@ def generate_document(
         "{{ДАТА}}":               today,
         "{{ID}}":                 id_,
         "{{ИИН}}":                iin,
+        # ФИО в падежах (pymorphy2)
+        "{{ФИО_РОД}}":            decline_full_name(full_name, "gent"),   # кого? Иванова И.И.
+        "{{ФИО_ДАТ}}":            decline_full_name(full_name, "datv"),   # кому? Иванову И.И.
+        "{{ФИО_ВИН}}":            decline_full_name(full_name, "accs"),   # кого? Иванова И.И.
+        "{{ФИО_ТВ}}":             decline_full_name(full_name, "ablt"),   # кем?  Ивановым И.И.
+        "{{ФИО_ПР}}":             decline_full_name(full_name, "loct"),   # о ком? Иванове И.И.
+        # Компания / документы
         "{{КОМПАНИЯ}}":           config.COMPANY_NAME,
         "{{БИН}}":                config.COMPANY_BIN,
         "{{ГОД}}":                str(datetime.now().year),
@@ -484,6 +651,8 @@ def generate_document(
         "{{НОМЕР_СПРАВКИ}}":      num_spravka,
         "{{НОМЕР_ДОВЕРЕННОСТИ}}": num_dov,
         "{{НОМЕР_ИСХ}}":          num_ish,
+        # Дата увольнения (если уже проставлена в таблице)
+        "{{ДАТА_УВОЛЬНЕНИЯ}}":    fire_date_str,
     }
     if extra_vars:
         variables.update(extra_vars)
@@ -552,18 +721,35 @@ def generate_document(
 
 # ── Запись в реестры ──────────────────────────────────────────────────────────
 
+def _next_empty_row(sheet: gspread.Worksheet, header_rows: int = 2) -> tuple[int, int]:
+    """
+    Возвращает (row_1based, serial_number) — номер первой пустой строки
+    после заголовков и порядковый номер новой записи.
+    """
+    all_rows = sheet.get_all_values()
+    data_rows = [r for r in all_rows[header_rows:] if any(r)]
+    serial = len(data_rows) + 1
+    next_row = len(all_rows) + 1  # строка после последней непустой
+    # Иногда get_all_values обрезает пустые строки — берём максимум
+    next_row = max(next_row, header_rows + len(data_rows) + 1)
+    return next_row, serial
+
+
 def _write_prikaz(entity: str, p: dict) -> None:
     sheet = _get_or_create_sheet(
         config.SHEET_PRIKAZ_CHK if entity == "ЧК" else config.SHEET_PRIKAZ_TOO
     )
     today = datetime.now().strftime("%d.%m.%Y")
-    next_row = sheet.get_all_values()
-    n = len([r for r in next_row[2:] if any(r)]) + 3
-    sheet.append_row([
-        n - 2, p["num"], p["city"], p["type"], p["emp_name"],
-        p["emp_id"], p["pos"], today, today,
-        p.get("dogovor", ""), "", p.get("file_url", ""), "Подписан"
-    ])
+    row_idx, serial = _next_empty_row(sheet, header_rows=2)
+    sheet.update(
+        range_name=f"A{row_idx}",
+        values=[[
+            serial, p["num"], p["city"], p["type"], p["emp_name"],
+            p["emp_id"], p["pos"], today, today,
+            p.get("dogovor", ""), "", p.get("file_url", ""), "Подписан"
+        ]],
+        value_input_option="USER_ENTERED",
+    )
 
 
 def _write_dogovor(entity: str, d: dict) -> None:
@@ -571,22 +757,30 @@ def _write_dogovor(entity: str, d: dict) -> None:
         config.SHEET_CHK if entity == "ЧК" else config.SHEET_TOO
     )
     today = datetime.now().strftime("%d.%m.%Y")
-    rows = sheet.get_all_values()
-    n = len([r for r in rows[2:] if any(r)]) + 1
-    sheet.append_row([
-        n, d["num"], d["type"], d["name"], d["iin"],
-        d["subject"], d["dept"], "", today, "",
-        "", "", "Работает", "", d.get("file_url", ""), ""
-    ])
+    row_idx, serial = _next_empty_row(sheet, header_rows=2)
+    sheet.update(
+        range_name=f"A{row_idx}",
+        values=[[
+            serial, d["num"], d["type"], d["name"], d["iin"],
+            d["subject"], d["dept"], "", today, "",
+            "", "", "Работает", "", d.get("file_url", ""), ""
+        ]],
+        value_input_option="USER_ENTERED",
+    )
 
 
 def _write_spravka(s: dict) -> None:
     sheet = _get_or_create_sheet(config.SHEET_SPRAVKA)
     today = datetime.now().strftime("%d.%m.%Y")
-    sheet.append_row([
-        s["num"], s["type"], s["name"], s["emp_id"],
-        today, "", "", "", s.get("file_url", "")
-    ])
+    row_idx, _ = _next_empty_row(sheet, header_rows=2)
+    sheet.update(
+        range_name=f"A{row_idx}",
+        values=[[
+            s["num"], s["type"], s["name"], s["emp_id"],
+            today, "", "", "", s.get("file_url", "")
+        ]],
+        value_input_option="USER_ENTERED",
+    )
 
 
 # ── Ежедневные проверки ───────────────────────────────────────────────────────

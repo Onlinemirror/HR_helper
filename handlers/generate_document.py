@@ -24,6 +24,10 @@ import google_api
 import keyboards as kb
 from states import GenerateDocument
 
+
+def _is_prikaz(template_name: str) -> bool:
+    return "приказ" in template_name.lower()
+
 logger = logging.getLogger(__name__)
 router = Router()
 
@@ -84,7 +88,7 @@ async def process_category(call: CallbackQuery, state: FSMContext) -> None:
     entity_code  = parts[2] if len(parts) > 2 else ""
     entity_label = {"TOO": "ТОО", "CHK": "ЧК"}.get(entity_code, "")
 
-    await state.update_data(category=category, entity=entity_label, entity_code=entity_code)
+    await state.update_data(category=category, entity=entity_label, entity_code=entity_code, prikaz_num=None)
     await call.message.edit_text(
         f"📄 Выберите документ ({entity_label or 'без юрлица'}):",
         reply_markup=kb.doc_type_kb(category, entity_code),
@@ -113,8 +117,22 @@ async def process_doc_type(call: CallbackQuery, state: FSMContext) -> None:
 
     await call.message.delete()
 
-    if extra_fields:
-        # Первое доп. поле
+    # Для приказов — спрашиваем номер (с авто-подсказкой)
+    if _is_prikaz(template_name):
+        data = await state.get_data()
+        entity_code = data.get("entity_code", "")
+        entity = {"TOO": "ТОО", "CHK": "ЧК"}.get(entity_code, "ЧК")
+        suggested = await to_thread(google_api.get_next_prikaz_number, entity)
+        await state.update_data(suggested_prikaz_num=suggested)
+        await call.message.answer(
+            f"📋 <b>Номер приказа</b>\n\n"
+            f"Следующий по счёту: <code>{suggested}</code>\n\n"
+            f"Нажмите <b>✅ Принять</b> — или введите номер вручную:",
+            reply_markup=kb.accept_num_kb(),
+            parse_mode="HTML",
+        )
+        await state.set_state(GenerateDocument.waiting_prikaz_num)
+    elif extra_fields:
         _, prompt, _ = extra_fields[0]
         await call.message.answer(prompt, reply_markup=kb.cancel_kb())
         await state.set_state(GenerateDocument.waiting_extra)
@@ -122,6 +140,30 @@ async def process_doc_type(call: CallbackQuery, state: FSMContext) -> None:
         await _show_confirm(call.message, state)
 
     await call.answer()
+
+
+# ── Шаг 5а — ввод/подтверждение номера приказа ────────────────────────────────
+
+@router.message(GenerateDocument.waiting_prikaz_num, CANCEL)
+async def process_prikaz_num(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    suggested = data.get("suggested_prikaz_num", "")
+
+    if message.text.strip() == "✅ Принять":
+        prikaz_num = suggested
+    else:
+        prikaz_num = message.text.strip()
+
+    await state.update_data(prikaz_num=prikaz_num)
+
+    # Переходим к доп. полям или сразу к подтверждению
+    extra_fields = data.get("extra_fields", [])
+    if extra_fields:
+        _, prompt, _ = extra_fields[0]
+        await message.answer(prompt, reply_markup=kb.cancel_kb())
+        await state.set_state(GenerateDocument.waiting_extra)
+    else:
+        await _show_confirm(message, state)
 
 
 # ── Шаг 5 — сбор доп. полей ───────────────────────────────────────────────────
@@ -190,6 +232,7 @@ async def process_confirm(message: Message, state: FSMContext) -> None:
     template_name = data["template_name"]
     entity        = data.get("entity", "")
     collected     = data.get("collected_extra", {})
+    prikaz_num    = data.get("prikaz_num")   # None если не приказ
 
     # Строим extra_vars: {{{TEMPLATE_VAR}}: value}
     extra_fields = config.EXTRA_FIELDS.get(template_name, [])
@@ -203,7 +246,7 @@ async def process_confirm(message: Message, state: FSMContext) -> None:
     try:
         result = await to_thread(
             google_api.generate_document,
-            template_name, entity, row_data, extra_vars
+            template_name, entity, row_data, extra_vars, prikaz_num
         )
         nums = result["numbers"]
         num_lines = ""

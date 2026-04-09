@@ -19,6 +19,7 @@ from middlewares import AccessControlMiddleware
 from handlers import (
     common, add_employee, fire_employee,
     upload_document, generate_document, evaluate_360,
+    employee_files,
 )
 from scheduler import setup_scheduler
 
@@ -79,6 +80,7 @@ async def main() -> None:
     dp.include_router(upload_document.router)
     dp.include_router(generate_document.router)
     dp.include_router(evaluate_360.router)
+    dp.include_router(employee_files.router)
 
     setup_scheduler(bot)
 
