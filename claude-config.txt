@@ -1,2 +1,0 @@
-KEY=sk-7jTwMQKmH44AuoJPX9hd8A
-MODEL=claude-sonnet
