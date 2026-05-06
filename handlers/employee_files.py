@@ -10,12 +10,10 @@ from aiogram import Bot, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
-CANCEL = lambda m: m.text != "🚫 Отмена"   # noqa: E731
-
 import config
-import google_api
-import keyboards as kb
-from states import DownloadEmployeeFiles
+from integrations import google_api
+from core import keyboards as kb
+from core.states import DownloadEmployeeFiles
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -29,8 +27,9 @@ MAX_FILE_BYTES = 50 * 1024 * 1024
 @router.message(lambda m: m.text == "📥 Файлы сотрудника")
 async def start_download(message: Message, state: FSMContext) -> None:
     await state.set_state(DownloadEmployeeFiles.waiting_employee)
+    await state.update_data(_user_id=message.from_user.id)
     await message.answer(
-        "🔍 Введите <b>ИИН</b> или <b>ID</b> сотрудника:",
+        "🔍 Введите <b>ИИН</b>, <b>ID</b> или <b>ФИО</b> сотрудника:",
         reply_markup=kb.cancel_kb(),
         parse_mode="HTML",
     )
@@ -42,18 +41,55 @@ async def start_download(message: Message, state: FSMContext) -> None:
 async def process_dl_employee(message: Message, state: FSMContext) -> None:
     if message.text == "🚫 Отмена":
         await state.clear()
-        await message.answer("Отменено.", reply_markup=kb.main_menu())
+        await message.answer("Отменено.", reply_markup=kb.main_menu(message.from_user.id))
         return
 
     query = message.text.strip()
     result = await to_thread(google_api.find_employee, query)
     if result is None:
-        await message.answer(
-            f"⚠️ Сотрудник <b>{escape(query)}</b> не найден. Попробуйте ещё раз:",
-            parse_mode="HTML",
-        )
-        return
+        candidates = await to_thread(google_api.find_employees_by_name, query)
+        if not candidates:
+            await message.answer(
+                f"⚠️ Сотрудник <b>{escape(query)}</b> не найден. Попробуйте ещё раз:",
+                parse_mode="HTML",
+            )
+            return
+        if len(candidates) == 1:
+            result = candidates[0]
+        else:
+            await state.update_data(emp_candidates=[(idx, row) for idx, row in candidates])
+            await message.answer(
+                "🔍 Найдено несколько сотрудников. Выберите нужного:",
+                reply_markup=kb.employee_select_kb(candidates, "dl_emp"),
+            )
+            return
 
+    await _proceed_dl(message, state, result)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("dl_emp:"))
+async def cb_dl_select(call: CallbackQuery, state: FSMContext) -> None:
+    part = call.data.split(":")[1]
+    if part == "cancel":
+        await state.clear()
+        await call.message.delete()
+        await call.message.answer("Отменено.", reply_markup=menu)
+        await call.answer()
+        return
+    data = await state.get_data()
+    candidates = data.get("emp_candidates", [])
+    idx = int(part)
+    if idx >= len(candidates):
+        await call.answer("Ошибка выбора", show_alert=True)
+        return
+    await call.message.delete()
+    await _proceed_dl(call.message, state, candidates[idx])
+    await call.answer()
+
+
+async def _proceed_dl(message: Message, state: FSMContext, result: tuple) -> None:
+    data = await state.get_data()
+    menu = kb.main_menu(data.get('_user_id', 0))
     _, row_data = result
     full_name  = row_data[config.COL["Полное ФИО"] - 1]
     drive_link = row_data[config.COL["Папка Drive (ссылка)"] - 1]
@@ -62,7 +98,7 @@ async def process_dl_employee(message: Message, state: FSMContext) -> None:
         await message.answer(
             "⚠️ У сотрудника нет папки на Google Drive.\n"
             "Сначала нажмите «📁 Синхронизировать папки Drive».",
-            reply_markup=kb.main_menu(),
+            reply_markup=menu,
         )
         await state.clear()
         return
@@ -76,7 +112,7 @@ async def process_dl_employee(message: Message, state: FSMContext) -> None:
     except Exception as e:
         await message.answer(
             f"❌ Ошибка получения папок:\n<code>{escape(str(e))}</code>",
-            reply_markup=kb.main_menu(),
+            reply_markup=menu,
             parse_mode="HTML",
         )
         await state.clear()
@@ -100,6 +136,7 @@ async def process_folder_select(call: CallbackQuery, state: FSMContext, bot: Bot
     data = await state.get_data()
     subfolders = data.get("subfolders", [])
     full_name  = data.get("full_name", "")
+    menu = kb.main_menu(data.get('_user_id', 0))
 
     if idx < 0 or idx >= len(subfolders):
         await call.answer("Папка не найдена", show_alert=True)
@@ -120,7 +157,7 @@ async def process_folder_select(call: CallbackQuery, state: FSMContext, bot: Bot
     except Exception as e:
         await call.message.answer(
             f"❌ Ошибка:\n<code>{escape(str(e))}</code>",
-            reply_markup=kb.main_menu(),
+            reply_markup=menu,
             parse_mode="HTML",
         )
         await state.clear()
@@ -129,7 +166,7 @@ async def process_folder_select(call: CallbackQuery, state: FSMContext, bot: Bot
     if not files:
         await call.message.answer(
             f"📭 Папка <b>{escape(folder_name)}</b> пуста.",
-            reply_markup=kb.main_menu(),
+            reply_markup=menu,
             parse_mode="HTML",
         )
         await state.clear()
@@ -190,7 +227,7 @@ async def process_folder_select(call: CallbackQuery, state: FSMContext, bot: Bot
 
     await call.message.answer(
         "\n".join(summary),
-        reply_markup=kb.main_menu(),
+        reply_markup=menu,
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
@@ -201,5 +238,5 @@ async def process_folder_select(call: CallbackQuery, state: FSMContext, bot: Bot
 async def cb_dl_cancel(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await call.message.delete()
-    await call.message.answer("Отменено.", reply_markup=kb.main_menu())
+    await call.message.answer("Отменено.", reply_markup=menu)
     await call.answer()

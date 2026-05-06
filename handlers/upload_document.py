@@ -1,6 +1,7 @@
 """FSM-диалог загрузки документа в папку сотрудника на Google Drive."""
 import logging
 from asyncio import to_thread
+from html import escape
 import os
 from pathlib import Path
 
@@ -12,9 +13,9 @@ from aiogram.types import CallbackQuery, Message
 CANCEL = F.text != "🚫 Отмена"
 
 import config
-import google_api
-import keyboards as kb
-from states import UploadDocument
+from integrations import google_api
+from core import keyboards as kb
+from core.states import UploadDocument
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -25,8 +26,9 @@ router = Router()
 @router.message(lambda m: m.text == "📄 Загрузить файл")
 async def start_upload(message: Message, state: FSMContext) -> None:
     await state.set_state(UploadDocument.waiting_employee_query)
+    await state.update_data(_user_id=message.from_user.id)
     await message.answer(
-        "🔍 Введите <b>ИИН</b> или <b>ID</b> сотрудника, в чью папку нужно загрузить документ:",
+        "🔍 Введите <b>ИИН</b>, <b>ID</b> или <b>ФИО</b> сотрудника:",
         reply_markup=kb.cancel_kb(),
         parse_mode="HTML",
     )
@@ -40,13 +42,49 @@ async def process_upload_query(message: Message, state: FSMContext) -> None:
 
     result = await to_thread(google_api.find_employee, query)
     if result is None:
-        await message.answer(
-            f"⚠️ Сотрудник с ИИН/ID <b>{query}</b> не найден.\n"
-            "Проверьте данные и попробуйте ещё раз:",
-            parse_mode="HTML",
-        )
-        return
+        candidates = await to_thread(google_api.find_employees_by_name, query)
+        if not candidates:
+            await message.answer(
+                f"⚠️ Сотрудник <b>{escape(query)}</b> не найден. Попробуйте ещё раз:",
+                parse_mode="HTML",
+            )
+            return
+        if len(candidates) == 1:
+            result = candidates[0]
+        else:
+            await state.update_data(emp_candidates=[(idx, row) for idx, row in candidates])
+            await message.answer(
+                "🔍 Найдено несколько сотрудников. Выберите нужного:",
+                reply_markup=kb.employee_select_kb(candidates, "up_emp"),
+            )
+            return
 
+    await _proceed_upload(message, state, result)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("up_emp:"))
+async def cb_up_select(call: CallbackQuery, state: FSMContext) -> None:
+    part = call.data.split(":")[1]
+    if part == "cancel":
+        await state.clear()
+        await call.message.delete()
+        await call.message.answer("Отменено.", reply_markup=kb.main_menu(call.from_user.id))
+        await call.answer()
+        return
+    data = await state.get_data()
+    candidates = data.get("emp_candidates", [])
+    idx = int(part)
+    if idx >= len(candidates):
+        await call.answer("Ошибка выбора", show_alert=True)
+        return
+    await call.message.delete()
+    await _proceed_upload(call.message, state, candidates[idx])
+    await call.answer()
+
+
+async def _proceed_upload(message: Message, state: FSMContext, result: tuple) -> None:
+    data = await state.get_data()
+    menu = kb.main_menu(data.get('_user_id', 0))
     row_index, row_data = result
     drive_link = row_data[config.COL["Папка Drive (ссылка)"] - 1]
 
@@ -54,7 +92,7 @@ async def process_upload_query(message: Message, state: FSMContext) -> None:
         await message.answer(
             "⚠️ У этого сотрудника не указана папка Google Drive.\n"
             "Обратитесь к администратору.",
-            reply_markup=kb.main_menu(),
+            reply_markup=menu,
         )
         await state.clear()
         return
@@ -97,9 +135,11 @@ async def process_upload_category(call: CallbackQuery, state: FSMContext) -> Non
 
 @router.callback_query(lambda c: c.data == "upload:cancel")
 async def cb_upload_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    menu = kb.main_menu(data.get("_user_id", call.from_user.id))
     await state.clear()
     await call.message.delete()
-    await call.message.answer("Отменено.", reply_markup=kb.main_menu())
+    await call.message.answer("Отменено.", reply_markup=menu)
     await call.answer()
 
 
@@ -122,6 +162,7 @@ async def process_file(message: Message, state: FSMContext, bot: Bot) -> None:
         return
 
     data         = await state.get_data()
+    menu         = kb.main_menu(data.get('_user_id', 0))
     folder_id    = data["folder_id"]
     full_name    = data["full_name"]
     doc_category = data.get("doc_category", "Прочее")
@@ -152,7 +193,7 @@ async def process_file(message: Message, state: FSMContext, bot: Bot) -> None:
             f"👤 Сотрудник: <b>{full_name}</b>\n"
             f"📁 Папка: <b>{doc_category}</b>\n\n"
             f"🔗 <a href=\"{file_link}\">Открыть файл на Drive</a>",
-            reply_markup=kb.main_menu(),
+            reply_markup=menu,
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
@@ -161,7 +202,7 @@ async def process_file(message: Message, state: FSMContext, bot: Bot) -> None:
         from html import escape
         await message.answer(
             f"❌ Ошибка при загрузке файла:\n<code>{escape(str(e))}</code>",
-            reply_markup=kb.main_menu(),
+            reply_markup=menu,
             parse_mode="HTML",
         )
     finally:

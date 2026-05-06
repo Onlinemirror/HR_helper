@@ -7,9 +7,8 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
-import google_api
-import keyboards as kb
-
+from integrations import google_api
+from core import keyboards as kb
 router = Router()
 
 
@@ -19,18 +18,19 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"👋 Добро пожаловать, {message.from_user.first_name}!\n"
         "Выберите действие в меню ниже.",
-        reply_markup=kb.main_menu(),
+        reply_markup=kb.main_menu(message.from_user.id),
     )
 
 
 @router.message(StateFilter("*"), lambda m: m.text == "🚫 Отмена")
 async def cancel_handler(message: Message, state: FSMContext) -> None:
+    menu = kb.main_menu(message.from_user.id)
     current = await state.get_state()
     if current is None:
-        await message.answer("Нет активного действия.", reply_markup=kb.main_menu())
+        await message.answer("Нет активного действия.", reply_markup=menu)
         return
     await state.clear()
-    await message.answer("❌ Действие отменено.", reply_markup=kb.main_menu())
+    await message.answer("❌ Действие отменено.", reply_markup=menu)
 
 
 @router.message(lambda m: m.text == "📁 Синхронизировать папки Drive")
@@ -47,30 +47,37 @@ async def sync_drive(message: Message) -> None:
         skipped = result["skipped"]
         errors  = result["errors"]
 
-        lines = []
+        menu = kb.main_menu(message.from_user.id)
 
-        if created:
-            lines.append(f"✅ <b>Создано папок: {len(created)}</b>")
-            for name in created:
-                lines.append(f"  • {escape(name)}")
-        else:
-            lines.append("✅ Новых папок для создания не найдено.")
+        # Итоговая строка — всегда отправляем одним сообщением
+        summary = (
+            f"✅ <b>Создано папок: {len(created)}</b>\n"
+            f"📁 Уже было папок: <b>{skipped}</b>"
+        )
+        if not created:
+            summary = f"✅ Новых папок для создания не найдено.\n📁 Уже было папок: <b>{skipped}</b>"
+        if errors:
+            summary += f"\n❌ <b>Ошибки: {len(errors)}</b>"
 
-        lines.append(f"\n📁 Уже было папок: <b>{skipped}</b>")
+        # Детальный список созданных — разбиваем по 50 имён на сообщение
+        CHUNK = 50
+        for i in range(0, len(created), CHUNK):
+            chunk = created[i:i + CHUNK]
+            chunk_lines = [f"  • {escape(name)}" for name in chunk]
+            part = f"📂 Созданные папки ({i+1}–{i+len(chunk)}):\n" + "\n".join(chunk_lines)
+            await message.answer(part, parse_mode="HTML")
 
         if errors:
-            lines.append(f"\n❌ <b>Ошибки ({len(errors)}):</b>")
-            for err in errors:
-                lines.append(f"  • {escape(err)}")
+            err_lines = [f"  • {escape(e)}" for e in errors]
+            await message.answer(
+                f"❌ <b>Ошибки ({len(errors)}):</b>\n" + "\n".join(err_lines),
+                parse_mode="HTML",
+            )
 
-        await message.answer(
-            "\n".join(lines),
-            reply_markup=kb.main_menu(),
-            parse_mode="HTML",
-        )
+        await message.answer(summary, reply_markup=menu, parse_mode="HTML")
     except Exception as e:
         await message.answer(
             f"❌ Ошибка при синхронизации:\n<code>{escape(str(e))}</code>",
-            reply_markup=kb.main_menu(),
+            reply_markup=kb.main_menu(message.from_user.id),
             parse_mode="HTML",
         )

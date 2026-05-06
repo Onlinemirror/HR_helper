@@ -15,13 +15,15 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
 import config
-from middlewares import AccessControlMiddleware
+from core.middlewares import AccessControlMiddleware
 from handlers import (
     common, add_employee, fire_employee,
     upload_document, generate_document, evaluate_360,
-    employee_files,
+    employee_files, employee_card, edit_employee, statistics, admin,
+    hr_onboarding,
 )
-from scheduler import setup_scheduler
+from core.scheduler import setup_scheduler
+from models.db import engine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,8 +62,21 @@ def _validate_config() -> None:
         sys.exit(1)
 
 
+async def _check_db() -> None:
+    """Проверить соединение с PostgreSQL при старте."""
+    try:
+        from sqlalchemy import text
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        logger.info("PostgreSQL: соединение установлено")
+    except Exception as e:
+        logger.error("PostgreSQL недоступен: %s", e)
+        sys.exit(1)
+
+
 async def main() -> None:
     _validate_config()
+    await _check_db()
     os.makedirs(config.TEMP_DIR, exist_ok=True)
 
     bot = Bot(
@@ -73,14 +88,20 @@ async def main() -> None:
 
     dp.message.middleware(AccessControlMiddleware())
 
-    # common первым — чтобы /start и 🚫 Отмена перехватывались до FSM-роутеров
+    # admin первым — /myid должна работать без проверки доступа (middleware пропускает)
+    dp.include_router(admin.router)
+    # common вторым — чтобы /start и 🚫 Отмена перехватывались до FSM-роутеров
     dp.include_router(common.router)
     dp.include_router(add_employee.router)
     dp.include_router(fire_employee.router)
+    dp.include_router(employee_card.router)
+    dp.include_router(edit_employee.router)
     dp.include_router(upload_document.router)
     dp.include_router(generate_document.router)
     dp.include_router(evaluate_360.router)
     dp.include_router(employee_files.router)
+    dp.include_router(statistics.router)
+    dp.include_router(hr_onboarding.router)
 
     setup_scheduler(bot)
 

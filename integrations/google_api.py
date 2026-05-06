@@ -8,7 +8,13 @@ import io
 import mimetypes
 import os
 import re
+import threading
 from datetime import datetime
+
+# Блокировки для get_or_create_subfolder — предотвращают race condition
+# когда несколько загрузок стартуют одновременно и каждая создаёт свою папку
+_subfolder_locks: dict[str, threading.Lock] = {}
+_subfolder_locks_meta = threading.Lock()  # защищает сам словарь блокировок
 
 import gspread
 from google.auth.transport.requests import Request
@@ -32,7 +38,7 @@ SCOPES_SA = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/documents",
 ]
-DRIVE_TOKEN_FILE = "drive_token.json"
+DRIVE_TOKEN_FILE = "credentials/drive_token.json"
 
 
 # ── Клиенты ────────────────────────────────────────────────────────────────────
@@ -168,6 +174,39 @@ def _replace_in_doc(doc_id: str, variables: dict) -> None:
         ).execute()
 
 
+def _replace_in_docx_bytes(content: bytes, variables: dict) -> bytes:
+    """
+    Заменяет {{ПЕРЕМЕННЫЕ}} в .docx через python-docx.
+    Обрабатывает случай, когда Word разбивает маркер на несколько runs:
+    объединяет текст всего абзаца, делает замену, кладёт результат в первый run.
+    """
+    from docx import Document as _DocxDocument
+
+    doc = _DocxDocument(io.BytesIO(content))
+
+    def _replace_para(para) -> None:
+        full = "".join(r.text for r in para.runs)
+        replaced = full
+        for key, val in variables.items():
+            replaced = replaced.replace(key, str(val) if val else "")
+        if replaced != full and para.runs:
+            para.runs[0].text = replaced
+            for run in para.runs[1:]:
+                run.text = ""
+
+    for para in doc.paragraphs:
+        _replace_para(para)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _replace_para(para)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
 def _get_prikaz_type(template_name: str) -> str:
     t = template_name.lower()
     if "прием" in t or "приём" in t: return "Приём"
@@ -207,6 +246,16 @@ def _decline_word(word: str, case: str) -> str:
         w = inflected.word
         return w[0].upper() + w[1:] if w else word
     return word
+
+
+def _short_name(last: str, first: str, middle: str) -> str:
+    """Амиров А.Ш. — фамилия + инициалы для подписей."""
+    parts = [last]
+    if first:
+        parts.append(first[0].upper() + ".")
+    if middle:
+        parts.append(middle[0].upper() + ".")
+    return " ".join(parts)
 
 
 def decline_full_name(full_name: str, case: str) -> str:
@@ -258,6 +307,60 @@ def find_employee(query: str) -> tuple[int, list[str]] | None:
     return None
 
 
+def find_employees_by_name(query: str) -> list[tuple[int, list[str]]]:
+    """Нечёткий поиск по ФИО: возвращает список (row_idx, row_data)."""
+    sheet = _master_sheet()
+    all_rows = sheet.get_all_values()
+    fio_col = config.COL["Полное ФИО"] - 1
+    q = query.strip().lower()
+    results = []
+    for idx, row in enumerate(all_rows[1:], start=2):
+        padded = row + [""] * (config.COL["Примечание"] - len(row))
+        if q in padded[fio_col].lower():
+            results.append((idx, padded))
+    return results
+
+
+def get_employee_history(employee_id: str) -> list[list[str]]:
+    """Возвращает строки лога изменений для данного сотрудника."""
+    log = _log_sheet()
+    rows = log.get_all_values()
+    # Колонка 3 (0-based: 2) — ID сотрудника
+    return [r for r in rows[1:] if len(r) > 2 and r[2] == employee_id]
+
+
+def get_statistics() -> dict:
+    """Статистика по активным сотрудникам."""
+    rows = get_all_active_employees()
+    by_dept: dict[str, int] = {}
+    by_city: dict[str, int] = {}
+    by_type: dict[str, int] = {}
+    dept_col = config.COL["Отдел"] - 1
+    city_col = config.COL["Город"] - 1
+    type_col = config.COL["Тип договора"] - 1
+    for row in rows:
+        dept = row[dept_col] or "—"
+        city = row[city_col] or "—"
+        ctype = row[type_col] or "—"
+        by_dept[dept] = by_dept.get(dept, 0) + 1
+        by_city[city] = by_city.get(city, 0) + 1
+        by_type[ctype] = by_type.get(ctype, 0) + 1
+    return {"total": len(rows), "by_dept": by_dept, "by_city": by_city, "by_type": by_type}
+
+
+def update_employee_field(row_index: int, row_data: list[str], field: str, new_value: str, author: str) -> None:
+    """Обновляет одно поле сотрудника и пишет в лог."""
+    sheet = _master_sheet()
+    col_num = config.COL[field]
+    old_value = row_data[col_num - 1]
+    sheet.update_cell(row_index, col_num, new_value)
+    log = _log_sheet()
+    now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    employee_id = row_data[config.COL["ID"] - 1]
+    full_name   = row_data[config.COL["Полное ФИО"] - 1]
+    log.append_row([now, config.MASTER_SHEET, employee_id, full_name, field, old_value, new_value, author])
+
+
 def get_all_active_employees() -> list[list[str]]:
     sheet = _master_sheet()
     all_rows = sheet.get_all_values()
@@ -285,21 +388,28 @@ def add_employee(data: dict, employee_id: str, drive_folder_link: str) -> None:
     row[config.COL["Имя"] - 1]                  = data["first_name"]
     row[config.COL["Отчество"] - 1]             = data.get("middle_name", "")
     row[config.COL["Полное ФИО"] - 1]           = full_name
+    row[config.COL["Дата рождения"] - 1]        = data.get("birth_date", "")
     row[config.COL["ИИН"] - 1]                  = data["iin"]
     row[config.COL["Город"] - 1]                = data["city"]
     row[config.COL["Отдел"] - 1]                = data["department"]
     row[config.COL["Должность"] - 1]            = data["position"]
+    row[config.COL["Тип договора"] - 1]         = data.get("contract_type", "")
+    row[config.COL["ЧК/ТОО"] - 1]              = data.get("legal_entity", "")
     row[config.COL["Дата приёма"] - 1]          = hire_date
     row[config.COL["Статус"] - 1]               = "Активный"
+    row[config.COL["Телефон"] - 1]              = data.get("phone", "")
+    row[config.COL["Email"] - 1]                = data.get("email", "")
+    row[config.COL["Руководитель"] - 1]         = data.get("manager", "")
     row[config.COL["Папка Drive (ссылка)"] - 1] = drive_folder_link
     sheet.append_row(row, value_input_option="USER_ENTERED")
 
 
 # ── Увольнение ────────────────────────────────────────────────────────────────
 
-def fire_employee(row_index: int, row_data: list[str], author: str) -> None:
+def fire_employee(row_index: int, row_data: list[str], author: str, fire_date: str | None = None) -> None:
     sheet = _master_sheet()
-    fire_date     = datetime.now().strftime("%d.%m.%Y")
+    # Если дата передана из хендлера — используем её, иначе берём сегодня
+    fire_date     = fire_date or datetime.now().strftime("%d.%m.%Y")
     old_status    = row_data[config.COL["Статус"] - 1]
     old_fire_date = row_data[config.COL["Дата увольнения"] - 1]
     employee_id   = row_data[config.COL["ID"] - 1]
@@ -429,8 +539,42 @@ def download_file_bytes(file_id: str, mime_type: str) -> bytes:
 
 
 def get_or_create_subfolder(parent_folder_id: str, subfolder_name: str) -> str:
-    """Находит или создаёт подпапку в папке сотрудника (через сервисный аккаунт)."""
-    return _find_or_create_folder_sa(subfolder_name, parent_folder_id)
+    """
+    Находит или создаёт подпапку категории внутри папки сотрудника.
+    Блокировка на (parent_folder_id, subfolder_name) предотвращает race condition:
+    несколько одновременных загрузок не создадут дубли папки.
+    """
+    lock_key = f"{parent_folder_id}:{subfolder_name}"
+    with _subfolder_locks_meta:
+        if lock_key not in _subfolder_locks:
+            _subfolder_locks[lock_key] = threading.Lock()
+    lock = _subfolder_locks[lock_key]
+
+    with lock:
+        drive = _drive_service()
+        # Получаем все подпапки родительской папки одним запросом и ищем в Python
+        res = drive.files().list(
+            q=(f"'{parent_folder_id}' in parents"
+               f" and mimeType='application/vnd.google-apps.folder'"
+               f" and trashed=false"),
+            fields="files(id,name)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            pageSize=100,
+        ).execute()
+        for f in res.get("files", []):
+            if f["name"] == subfolder_name:
+                return f["id"]
+        # Не нашли — создаём
+        meta = {
+            "name": subfolder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_folder_id],
+        }
+        folder = drive.files().create(
+            body=meta, fields="id", supportsAllDrives=True
+        ).execute()
+        return folder["id"]
 
 
 def upload_file_to_drive(local_path: str, file_name: str, folder_id: str) -> str:
@@ -448,57 +592,78 @@ def upload_file_to_drive(local_path: str, file_name: str, folder_id: str) -> str
 
 # ── Нумерация документов ──────────────────────────────────────────────────────
 
+def _max_serial(values: list[str], year: int) -> int:
+    """
+    Из списка строк вида «№ 007-ЛС/2026-ЧК», «ТД-ТОО-2026-012», «СПР-2026-003»
+    извлекает максимальный порядковый номер для заданного года.
+    Работает надёжнее подсчёта строк: дубли и удалённые строки не сбивают счётчик.
+    """
+    import re
+    year_str = str(year)
+    max_num = 0
+    for val in values:
+        if year_str not in val:
+            continue
+        # ищем все последовательности цифр и берём последнюю (обычно это серийный номер)
+        nums = re.findall(r"\d+", val)
+        for n in nums:
+            if n == year_str:
+                continue
+            try:
+                max_num = max(max_num, int(n))
+            except ValueError:
+                pass
+    return max_num
+
+
 def get_next_prikaz_number(entity: str) -> str:
-    """№ 001-ЛС/2025-ТОО"""
+    """№ 001-ЛС/2026-ЧК — берёт max номера из колонки, не считает строки."""
     sheet_name = config.SHEET_PRIKAZ_CHK if entity == "ЧК" else config.SHEET_PRIKAZ_TOO
     sheet = _get_or_create_sheet(sheet_name)
     year = datetime.now().year
     all_rows = sheet.get_all_values()
-    count = 0
-    for row in all_rows[2:]:
-        if len(row) > 7 and row[7]:
-            try:
-                if datetime.strptime(str(row[7])[:10], "%d.%m.%Y").year == year:
-                    count += 1
-            except ValueError:
-                pass
-    return f"№ {count + 1:03d}-ЛС/{year}-{entity}"
+    # Приказы_ТОО: номер в col 3 (idx 2); Приказы_ЧК: номер в col 4 (idx 3)
+    num_col = 3 if entity == "ЧК" else 2
+    nums = [row[num_col] for row in all_rows[1:] if len(row) > num_col and row[num_col]]
+    max_num = _max_serial(nums, year)
+    return f"№ {max_num + 1:03d}-ЛС/{year}-{entity}"
 
 
 def get_next_dogovor_number(entity: str, doc_type: str) -> str:
-    """ТД-ТОО-2025-001 / ГПХ-ЧК-2025-001"""
+    """ТД-ТОО-2026-001 — берёт max из колонки номеров договоров."""
     sheet_name = config.SHEET_CHK if entity == "ЧК" else config.SHEET_TOO
     sheet = _get_or_create_sheet(sheet_name)
     year = datetime.now().year
     all_rows = sheet.get_all_values()
-    count = 0
-    for row in all_rows[2:]:
-        if len(row) > 8 and row[2] == doc_type and row[8]:
-            try:
-                if datetime.strptime(str(row[8])[:10], "%d.%m.%Y").year == year:
-                    count += 1
-            except ValueError:
-                pass
-    return f"{doc_type}-{entity}-{year}-{count + 1:03d}"
+    # Ищем номера, содержащие doc_type и entity (формат ТД-ТОО-2026-001)
+    nums = []
+    for row in all_rows[1:]:
+        if not row:
+            continue
+        for cell in row:
+            if doc_type in cell and entity in cell and str(year) in cell:
+                nums.append(cell)
+                break
+    max_num = _max_serial(nums, year)
+    return f"{doc_type}-{entity}-{year}-{max_num + 1:03d}"
 
 
 def get_next_doc_number(prefix: str, type_filter: str | None) -> str:
-    """СПР-2025-001 / ДОВ-2025-001 / ИСХ-2025-001"""
+    """СПР-2026-001 / ДОВ-2026-001 / ИСХ-2026-001 — берёт max из колонки."""
     sheet = _get_or_create_sheet(config.SHEET_SPRAVKA)
     year = datetime.now().year
     all_rows = sheet.get_all_values()
-    count = 0
-    for row in all_rows[2:]:
-        if len(row) < 5 or not row[4]:
+    nums = []
+    for row in all_rows[1:]:
+        if not row:
             continue
-        if type_filter and (len(row) < 2 or row[1] != type_filter):
-            continue
-        try:
-            if datetime.strptime(str(row[4])[:10], "%d.%m.%Y").year == year:
-                count += 1
-        except ValueError:
-            pass
-    return f"{prefix}-{year}-{count + 1:03d}"
+        # ищем ячейку с нашим префиксом и годом
+        for cell in row:
+            if prefix in cell and str(year) in cell:
+                nums.append(cell)
+                break
+    max_num = _max_serial(nums, year)
+    return f"{prefix}-{year}-{max_num + 1:03d}"
 
 
 def lookup_last_dogovor(full_name: str, entity: str) -> str:
@@ -590,38 +755,7 @@ def generate_document(
 
     GDOC_MIME = "application/vnd.google-apps.document"
 
-    if template_mime == GDOC_MIME:
-        # Нативный Google Doc — просто копируем
-        copied = drive_sa.files().copy(
-            fileId=template_file_id,
-            body={"name": doc_name, "parents": [dest_folder_id]},
-            supportsAllDrives=True,
-            fields="id",
-        ).execute()
-        doc_id = copied["id"]
-    else:
-        # .docx / .doc — скачиваем через SA, импортируем через OAuth (квота пользователя)
-        content = drive_sa.files().get_media(fileId=template_file_id).execute()
-        word_mime = ("application/vnd.openxmlformats-officedocument"
-                     ".wordprocessingml.document")
-        drive_oauth = _drive_service()
-        media = MediaIoBaseUpload(io.BytesIO(content), mimetype=word_mime, resumable=False)
-        imported = drive_oauth.files().create(
-            body={"name": doc_name, "mimeType": GDOC_MIME, "parents": [dest_folder_id]},
-            media_body=media,
-            supportsAllDrives=True,
-            fields="id",
-        ).execute()
-        doc_id = imported["id"]
-        # Даём сервисному аккаунту доступ к файлу для Docs API
-        sa_email = _sa_credentials().service_account_email
-        drive_oauth.permissions().create(
-            fileId=doc_id,
-            body={"type": "user", "role": "writer", "emailAddress": sa_email},
-            supportsAllDrives=True,
-        ).execute()
-
-    # ── Заменяем переменные ────────────────────────────────────────────────
+    # ── Собираем переменные для замены ───────────────────────────────────────
     fire_date_str = employee_row[config.COL["Дата увольнения"] - 1]
 
     variables = {
@@ -634,12 +768,12 @@ def generate_document(
         "{{ДАТА}}":               today,
         "{{ID}}":                 id_,
         "{{ИИН}}":                iin,
-        # ФИО в падежах (pymorphy2)
-        "{{ФИО_РОД}}":            decline_full_name(full_name, "gent"),   # кого? Иванова И.И.
-        "{{ФИО_ДАТ}}":            decline_full_name(full_name, "datv"),   # кому? Иванову И.И.
-        "{{ФИО_ВИН}}":            decline_full_name(full_name, "accs"),   # кого? Иванова И.И.
-        "{{ФИО_ТВ}}":             decline_full_name(full_name, "ablt"),   # кем?  Ивановым И.И.
-        "{{ФИО_ПР}}":             decline_full_name(full_name, "loct"),   # о ком? Иванове И.И.
+        # ФИО в падежах (pymorphy3)
+        "{{ФИО_РОД}}":            decline_full_name(full_name, "gent"),
+        "{{ФИО_ДАТ}}":            decline_full_name(full_name, "datv"),
+        "{{ФИО_ВИН}}":            decline_full_name(full_name, "accs"),
+        "{{ФИО_ТВ}}":             decline_full_name(full_name, "ablt"),
+        "{{ФИО_ПР}}":             decline_full_name(full_name, "loct"),
         # Компания / документы
         "{{КОМПАНИЯ}}":           config.COMPANY_NAME,
         "{{БИН}}":                config.COMPANY_BIN,
@@ -651,12 +785,50 @@ def generate_document(
         "{{НОМЕР_СПРАВКИ}}":      num_spravka,
         "{{НОМЕР_ДОВЕРЕННОСТИ}}": num_dov,
         "{{НОМЕР_ИСХ}}":          num_ish,
-        # Дата увольнения (если уже проставлена в таблице)
         "{{ДАТА_УВОЛЬНЕНИЯ}}":    fire_date_str,
+        # Дополнительные поля из мастер-листа
+        "{{АДРЕС}}":              employee_row[config.COL["Адрес"] - 1],
+        "{{РУКОВОДИТЕЛЬ}}":       employee_row[config.COL["Руководитель"] - 1],
+        "{{ТЕЛЕФОН}}":            employee_row[config.COL["Телефон"] - 1],
+        # Фамилия И.О. — для подписей
+        "{{ФИО_КРАТКО}}":         _short_name(last_name, first_name, middle),
     }
     if extra_vars:
         variables.update(extra_vars)
-    _replace_in_doc(doc_id, variables)
+
+    if template_mime == GDOC_MIME:
+        # Нативный Google Doc — копируем, затем заменяем через Docs API
+        copied = drive_sa.files().copy(
+            fileId=template_file_id,
+            body={"name": doc_name, "parents": [dest_folder_id]},
+            supportsAllDrives=True,
+            fields="id",
+        ).execute()
+        doc_id = copied["id"]
+        # Даём сервисному аккаунту доступ к файлу для Docs API
+        sa_email = _sa_credentials().service_account_email
+        _drive_service().permissions().create(
+            fileId=doc_id,
+            body={"type": "user", "role": "writer", "emailAddress": sa_email},
+            supportsAllDrives=True,
+        ).execute()
+        _replace_in_doc(doc_id, variables)
+    else:
+        # .docx — скачиваем через SA, заменяем локально (python-docx),
+        # импортируем готовый .docx через OAuth (квота пользователя)
+        content = drive_sa.files().get_media(fileId=template_file_id).execute()
+        modified = _replace_in_docx_bytes(content, variables)
+        word_mime = ("application/vnd.openxmlformats-officedocument"
+                     ".wordprocessingml.document")
+        drive_oauth = _drive_service()
+        media = MediaIoBaseUpload(io.BytesIO(modified), mimetype=word_mime, resumable=False)
+        imported = drive_oauth.files().create(
+            body={"name": doc_name, "mimeType": GDOC_MIME, "parents": [dest_folder_id]},
+            media_body=media,
+            supportsAllDrives=True,
+            fields="id",
+        ).execute()
+        doc_id = imported["id"]
 
     # ── Экспортируем в PDF и загружаем через OAuth ─────────────────────────
     drive_oauth = _drive_service()
@@ -736,18 +908,22 @@ def _next_empty_row(sheet: gspread.Worksheet, header_rows: int = 2) -> tuple[int
 
 
 def _write_prikaz(entity: str, p: dict) -> None:
+    """
+    Приказы_ТОО: дата | ФИО | номер приказа | тип | Город | № ТД
+    Приказы_ЧК:  дата | ФИО | тип           | номер приказа | Город | Примечание
+    """
     sheet = _get_or_create_sheet(
         config.SHEET_PRIKAZ_CHK if entity == "ЧК" else config.SHEET_PRIKAZ_TOO
     )
     today = datetime.now().strftime("%d.%m.%Y")
-    row_idx, serial = _next_empty_row(sheet, header_rows=2)
+    row_idx, _ = _next_empty_row(sheet, header_rows=1)
+    if entity == "ЧК":
+        row = [today, p["emp_name"], p["type"], p["num"], p["city"], ""]
+    else:
+        row = [today, p["emp_name"], p["num"], p["type"], p["city"], p.get("dogovor", "")]
     sheet.update(
         range_name=f"A{row_idx}",
-        values=[[
-            serial, p["num"], p["city"], p["type"], p["emp_name"],
-            p["emp_id"], p["pos"], today, today,
-            p.get("dogovor", ""), "", p.get("file_url", ""), "Подписан"
-        ]],
+        values=[row],
         value_input_option="USER_ENTERED",
     )
 
@@ -786,29 +962,31 @@ def _write_spravka(s: dict) -> None:
 # ── Ежедневные проверки ───────────────────────────────────────────────────────
 
 def check_birthdays() -> list[str]:
-    """Возвращает список строк-уведомлений о ближайших ДР."""
-    try:
-        sheet = _get_or_create_sheet(config.SHEET_BDAY)
-    except Exception:
-        return []
+    """Возвращает список строк-уведомлений о ближайших ДР из мастер-листа."""
+    sheet = _master_sheet()
     all_rows = sheet.get_all_values()
-    today = datetime.now()
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     alerts = []
-    for row in all_rows[2:]:
-        if len(row) < 4 or not row[3]:
+    fio_col    = config.COL["Полное ФИО"] - 1
+    city_col   = config.COL["Город"] - 1
+    bd_col     = config.COL["Дата рождения"] - 1
+    status_col = config.COL["Статус"] - 1
+    for row in all_rows[1:]:
+        padded = row + [""] * (config.COL["Примечание"] - len(row))
+        if padded[status_col] == "Уволен" or not padded[bd_col]:
             continue
-        name = row[1]
-        city = row[2] if len(row) > 2 else ""
         try:
-            bd = datetime.strptime(str(row[3])[:10], "%d.%m.%Y")
+            bd = datetime.strptime(str(padded[bd_col])[:10], "%d.%m.%Y")
         except ValueError:
             continue
         next_bd = bd.replace(year=today.year)
-        if next_bd < today.replace(hour=0, minute=0, second=0, microsecond=0):
+        if next_bd < today:
             next_bd = next_bd.replace(year=today.year + 1)
-        diff = (next_bd - today.replace(hour=0, minute=0, second=0, microsecond=0)).days
+        diff = (next_bd - today).days
         if 0 <= diff <= config.DAYS_BEFORE_BDAY:
-            age = today.year - bd.year
+            name = padded[fio_col]
+            city = padded[city_col]
+            age  = today.year - bd.year + (0 if next_bd.year > today.year else 0)
             suffix = "🎂 СЕГОДНЯ!" if diff == 0 else f"через {diff} дн."
             alerts.append(f"• {name} ({city}) — {suffix}, исполняется {age} лет")
     return alerts

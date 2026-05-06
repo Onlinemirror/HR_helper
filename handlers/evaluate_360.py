@@ -9,9 +9,9 @@ CANCEL = F.text != "🚫 Отмена"
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-import google_api
-import keyboards as kb
-from states import Evaluate360
+from integrations import google_api
+from core import keyboards as kb
+from core.states import Evaluate360
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -43,23 +43,63 @@ async def start_360(message: Message, state: FSMContext) -> None:
 async def process_employee_360(message: Message, state: FSMContext) -> None:
     query = message.text.strip()
     result = await to_thread(google_api.find_employee, query)
+
     if result is None:
-        await message.answer(
-            f"⚠️ Сотрудник <b>{escape(query)}</b> не найден. Попробуйте ещё раз:",
-            parse_mode="HTML",
-        )
-        return
+        # Пробуем поиск по ФИО
+        candidates = await to_thread(google_api.find_employees_by_name, query)
+        if not candidates:
+            await message.answer(
+                f"⚠️ Сотрудник <b>{escape(query)}</b> не найден. Попробуйте ещё раз:",
+                parse_mode="HTML",
+            )
+            return
+        if len(candidates) == 1:
+            result = candidates[0]
+        else:
+            await state.update_data(emp_candidates=candidates)
+            await message.answer(
+                "🔍 Найдено несколько сотрудников. Выберите нужного:",
+                reply_markup=kb.employee_select_kb(candidates, "eval_emp"),
+            )
+            return
 
     _, row_data = result
-    full_name = row_data[4]  # Полное ФИО
-    await state.update_data(row_data=row_data, scores={}, criteria_idx=0)
+    await _start_scoring(message, state, row_data)
 
+
+# ── Выбор из списка найденных по ФИО ─────────────────────────────────────────
+
+@router.callback_query(lambda c: c.data and c.data.startswith("eval_emp:"))
+async def cb_eval_select(call: CallbackQuery, state: FSMContext) -> None:
+    part = call.data.split(":")[1]
+    if part == "cancel":
+        await state.clear()
+        await call.message.delete()
+        await call.message.answer("Отменено.", reply_markup=kb.main_menu(call.from_user.id))
+        await call.answer()
+        return
+    data = await state.get_data()
+    candidates = data.get("emp_candidates", [])
+    idx = int(part)
+    if idx >= len(candidates):
+        await call.answer("Ошибка выбора", show_alert=True)
+        return
+    _, row_data = candidates[idx]
+    await call.message.delete()
+    await _start_scoring(call.message, state, row_data)
+    await call.answer()
+
+
+async def _start_scoring(message: Message, state: FSMContext, row_data: list) -> None:
+    """Начинаем опрос оценок после того как сотрудник найден."""
+    import config as cfg
+    full_name = row_data[cfg.COL["Полное ФИО"] - 1]
+    await state.update_data(row_data=row_data, scores={}, criteria_idx=0)
     await message.answer(
         f"✅ Оцениваете: <b>{escape(full_name)}</b>\n\nОцените каждый критерий от 1 до 5.",
         reply_markup=kb.remove_kb,
         parse_mode="HTML",
     )
-    # Первый критерий
     key, label = CRITERIA[0]
     await message.answer(label, reply_markup=kb.score_kb(key))
     await state.set_state(Evaluate360.score_quality)
@@ -154,12 +194,13 @@ async def process_improve(message: Message, state: FSMContext) -> None:
 
 @router.message(Evaluate360.confirm)
 async def process_360_confirm(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    menu = kb.main_menu(message.from_user.id)
+    await state.clear()
     if message.text != "✅ Подтвердить":
-        await message.answer("Отменено.", reply_markup=kb.main_menu())
-        await state.clear()
+        await message.answer("Отменено.", reply_markup=menu)
         return
 
-    data      = await state.get_data()
     evaluator = (f"@{message.from_user.username}"
                  if message.from_user.username
                  else str(message.from_user.id))
@@ -172,16 +213,11 @@ async def process_360_confirm(message: Message, state: FSMContext) -> None:
             data.get("strengths", ""),
             data.get("improve", ""),
         )
-        await message.answer(
-            "✅ Оценка сохранена в таблицу.",
-            reply_markup=kb.main_menu(),
-        )
+        await message.answer("✅ Оценка сохранена в таблицу.", reply_markup=menu)
     except Exception as e:
         logger.exception("Ошибка сохранения оценки 360")
         await message.answer(
             f"❌ Ошибка:\n<code>{escape(str(e))}</code>",
-            reply_markup=kb.main_menu(),
+            reply_markup=menu,
             parse_mode="HTML",
         )
-    finally:
-        await state.clear()

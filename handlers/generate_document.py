@@ -14,15 +14,15 @@ from asyncio import to_thread
 from html import escape
 
 from aiogram import F, Router
-
-CANCEL = F.text != "🚫 Отмена"
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
+CANCEL = F.text != "🚫 Отмена"
+
 import config
-import google_api
-import keyboards as kb
-from states import GenerateDocument
+from integrations import google_api
+from core import keyboards as kb
+from core.states import GenerateDocument
 
 
 def _is_prikaz(template_name: str) -> bool:
@@ -45,8 +45,9 @@ CRITERIA_LABELS = {
 @router.message(lambda m: m.text == "📋 Создать документ")
 async def start_generate(message: Message, state: FSMContext) -> None:
     await state.set_state(GenerateDocument.waiting_employee)
+    await state.update_data(_user_id=message.from_user.id)
     await message.answer(
-        "🔍 Введите <b>ИИН</b> или <b>ID</b> сотрудника:",
+        "🔍 Введите <b>ИИН</b>, <b>ID</b> или <b>ФИО</b> сотрудника:",
         reply_markup=kb.cancel_kb(),
         parse_mode="HTML",
     )
@@ -59,12 +60,47 @@ async def process_employee(message: Message, state: FSMContext) -> None:
     query = message.text.strip()
     result = await to_thread(google_api.find_employee, query)
     if result is None:
-        await message.answer(
-            f"⚠️ Сотрудник <b>{escape(query)}</b> не найден. Попробуйте ещё раз:",
-            parse_mode="HTML",
-        )
-        return
+        candidates = await to_thread(google_api.find_employees_by_name, query)
+        if not candidates:
+            await message.answer(
+                f"⚠️ Сотрудник <b>{escape(query)}</b> не найден. Попробуйте ещё раз:",
+                parse_mode="HTML",
+            )
+            return
+        if len(candidates) == 1:
+            result = candidates[0]
+        else:
+            await state.update_data(emp_candidates=[(idx, row) for idx, row in candidates])
+            await message.answer(
+                "🔍 Найдено несколько сотрудников. Выберите нужного:",
+                reply_markup=kb.employee_select_kb(candidates, "gen_emp"),
+            )
+            return
 
+    await _proceed_generate(message, state, result)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("gen_emp:"))
+async def cb_gen_select(call: CallbackQuery, state: FSMContext) -> None:
+    part = call.data.split(":")[1]
+    if part == "cancel":
+        await state.clear()
+        await call.message.delete()
+        await call.message.answer("Отменено.", reply_markup=kb.main_menu(call.from_user.id))
+        await call.answer()
+        return
+    data = await state.get_data()
+    candidates = data.get("emp_candidates", [])
+    idx = int(part)
+    if idx >= len(candidates):
+        await call.answer("Ошибка выбора", show_alert=True)
+        return
+    await call.message.delete()
+    await _proceed_generate(call.message, state, candidates[idx])
+    await call.answer()
+
+
+async def _proceed_generate(message: Message, state: FSMContext, result: tuple) -> None:
     row_index, row_data = result
     await state.update_data(row_index=row_index, row_data=row_data)
 
@@ -202,9 +238,15 @@ async def _show_confirm(message: Message, state: FSMContext) -> None:
     full_name = row_data[config.COL["Полное ФИО"] - 1]
     position  = row_data[config.COL["Должность"] - 1]
 
+    # Строим читаемые метки из EXTRA_FIELDS: {field_key: prompt_text}
+    # Промпт выглядит как "💰 Введите оклад:" — берём его как метку
+    extra_fields_def = config.EXTRA_FIELDS.get(template_name, [])
+    labels = {field_key: prompt.rstrip(":").strip() for field_key, prompt, _ in extra_fields_def}
+
     extra_lines = ""
     for key, value in collected.items():
-        extra_lines += f"\n   {key}: <b>{escape(value)}</b>"
+        label = labels.get(key, key)  # если метка не найдена — показываем ключ
+        extra_lines += f"\n   {label}: <b>{escape(value)}</b>"
 
     text = (
         f"📋 <b>Подтвердите создание документа:</b>\n\n"
@@ -222,12 +264,12 @@ async def _show_confirm(message: Message, state: FSMContext) -> None:
 
 @router.message(GenerateDocument.confirm)
 async def process_confirm(message: Message, state: FSMContext) -> None:
-    if message.text != "✅ Подтвердить":
-        await message.answer("Отменено.", reply_markup=kb.main_menu())
-        await state.clear()
-        return
-
     data          = await state.get_data()
+    menu = kb.main_menu(data.get('_user_id', 0))
+    await state.clear()
+    if message.text != "✅ Подтвердить":
+        await message.answer("Отменено.", reply_markup=menu)
+        return
     row_data      = data["row_data"]
     template_name = data["template_name"]
     entity        = data.get("entity", "")
@@ -261,7 +303,7 @@ async def process_confirm(message: Message, state: FSMContext) -> None:
             f"📁 {escape(result['doc_name'])}"
             + num_lines +
             f"\n\n🔗 <a href=\"{result['pdf_url']}\">Открыть PDF</a>",
-            reply_markup=kb.main_menu(),
+            reply_markup=menu,
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
@@ -269,18 +311,16 @@ async def process_confirm(message: Message, state: FSMContext) -> None:
         await message.answer(
             f"❌ Шаблон не найден:\n<code>{escape(str(e))}</code>\n\n"
             "Убедитесь, что шаблон находится в папке «Шаблоны» на Google Drive.",
-            reply_markup=kb.main_menu(),
+            reply_markup=menu,
             parse_mode="HTML",
         )
     except Exception as e:
         logger.exception("Ошибка генерации документа")
         await message.answer(
             f"❌ Ошибка:\n<code>{escape(str(e))}</code>",
-            reply_markup=kb.main_menu(),
+            reply_markup=menu,
             parse_mode="HTML",
         )
-    finally:
-        await state.clear()
 
 
 # ── Вспомогательные callbacks ─────────────────────────────────────────────────
@@ -289,7 +329,7 @@ async def process_confirm(message: Message, state: FSMContext) -> None:
 async def cb_cancel(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await call.message.delete()
-    await call.message.answer("Отменено.", reply_markup=kb.main_menu())
+    await call.message.answer("Отменено.", reply_markup=kb.main_menu(call.from_user.id))
     await call.answer()
 
 

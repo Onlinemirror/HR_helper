@@ -13,7 +13,7 @@ load_dotenv()
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 CREDENTIALS_FILE = os.getenv("OAUTH_CREDENTIALS_FILE", "oauth_credentials.json")
-TOKEN_FILE = "drive_token.json"
+TOKEN_FILE = "credentials/drive_token.json"
 
 def main():
     if not os.path.exists(CREDENTIALS_FILE):

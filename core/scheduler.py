@@ -9,14 +9,16 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot
 
 import config
-import google_api
+from integrations import google_api
+from . import user_store
 
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler(timezone="Asia/Almaty")
 
 
 async def _send_all(bot: Bot, text: str) -> None:
-    for uid in config.ALLOWED_USERS:
+    # Берём актуальный список из user_store — включает и .env-админов и добавленных через бота
+    for uid in user_store.ALLOWED_USERS:
         try:
             await bot.send_message(uid, text, parse_mode="HTML")
         except Exception as e:
